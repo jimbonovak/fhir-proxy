@@ -86,6 +86,9 @@ namespace FHIRProxy.postprocessors
 
                         // explicitely set the bulk queue details
                         _qname_bulk = Utils.GetEnvironmentVariable("SA-SERVICEBUSQUEUENAMEFHIRBULK");
+
+                        log.LogInformation($"Initialize bulk queue: {_qname_bulk}");
+
                         _queueClientBulk = new ServiceBusClient(serviceBusName);
                         _senderBulk = _queueClientBulk.CreateSender(_qname_bulk);
                     }
@@ -94,14 +97,11 @@ namespace FHIRProxy.postprocessors
                         log.LogError($"FHIRCDSSyncAgentPostProcess2: Failed to initialize ServiceBusClient:{e.Message}->{e.StackTrace}");
                         initializationfailed = true;
                     }
-                } 
+                }
             }
-            
-            
         }
         public async Task<ProxyProcessResult> Process(FHIRResponse response, HttpRequest req, ILogger log, ClaimsPrincipal principal)
-        {
-            
+        {            
             try
             {
                 FHIRParsedPath pp = req.parsePath();
@@ -168,17 +168,20 @@ namespace FHIRProxy.postprocessors
         {
             if (!entries.IsNullOrEmpty())
             {
+                log.LogInformation($"Processing entries: {entries.Count}");
                 using ServiceBusMessageBatch messageBatch = await _sender.CreateMessageBatchAsync();
                 using ServiceBusMessageBatch messageBatchBulk = await _senderBulk.CreateMessageBatchAsync();
 
                 foreach (JToken tok in entries)
                 {
-                    //Don't queue if no supported
-                    if (!Array.Exists(_fhirSupportedResources, element => element == tok["resource"].FHIRResourceType()))
-                        continue;
-
                     string entrystatus = (string)tok["response"]["status"];
-                    
+                    var resourceType = tok["resource"].FHIRResourceType();
+
+                    log.LogInformation($"Processing entry {resourceType}, status: {entrystatus}");
+
+                    //Don't queue if no supported
+                    if (!Array.Exists(_fhirSupportedResources, element => element == resourceType))
+                        continue;
                     ServiceBusMessage dta = createMsg(entrystatus, tok["resource"], out bool bulkQueue);
 
                     if (bulkQueue) 
@@ -197,8 +200,15 @@ namespace FHIRProxy.postprocessors
                     }
                 }
                 // Send the message batch to the queue.
-                await _sender.SendMessagesAsync(messageBatch);
-                await _senderBulk.SendMessagesAsync(messageBatch);
+
+                if (messageBatch.Count > 0) { 
+                    await _sender.SendMessagesAsync(messageBatch); 
+                }
+
+                if (messageBatchBulk.Count > 0) {
+                    log.LogInformation($"Sending {messageBatchBulk.Count} messages to Bulk Queue");
+                    await _senderBulk.SendMessagesAsync(messageBatchBulk); 
+                }
             }
         }
         private ServiceBusMessage createMsg(string status,JToken resource, out bool bulkQueue)
@@ -224,7 +234,8 @@ namespace FHIRProxy.postprocessors
             if (!_bulkLoadMode)
             {
                 //Partioning and Session locks are defaulted to resource type, if the resource is patient/subject based the key will be the reference
-                string partitionkey = resource.FHIRResourceType();
+                string partitionkey = resource.FHIRReferenceId();
+
                 if (resource.FHIRResourceType().Equals("Patient"))
                 {
                     partitionkey = resource.FHIRReferenceId();
@@ -241,7 +252,6 @@ namespace FHIRProxy.postprocessors
                 else 
                 {
                     // create a new Partition key
-                    partitionkey = resource.FHIRReferenceId();
                     bulkQueue = true;
                 }
 
