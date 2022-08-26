@@ -32,7 +32,12 @@ namespace FHIRProxy.postprocessors
         private ServiceBusClient _queueClient = null;
         private ServiceBusSender _sender = null;
 
+        private ServiceBusClient _queueClientBulk = null;
+        private ServiceBusSender _senderBulk = null;
+
         private string _qname = null;
+        private string _qname_bulk = null;
+
         private Object lockobj = new object();
         private string[] _fhirSupportedResources = null;
         private bool initializationfailed = false;
@@ -64,6 +69,7 @@ namespace FHIRProxy.postprocessors
                         {
                             _qname = Utils.GetEnvironmentVariable("SA-SERVICEBUSQUEUENAMEFHIRUPDATES");
                         }
+
                         string fsr = Utils.GetEnvironmentVariable("SA-FHIRMAPPEDRESOURCES");
                         if (!string.IsNullOrEmpty(fsr)) _fhirSupportedResources=fsr.Split(",");
                         if (string.IsNullOrEmpty(_sbcfhirupdates) || string.IsNullOrEmpty(_qname))
@@ -72,10 +78,16 @@ namespace FHIRProxy.postprocessors
                             initializationfailed = true;
                             return;
                         }
-                        _queueClient = new ServiceBusClient(Utils.GetEnvironmentVariable("SA-SERVICEBUSNAMESPACEFHIRUPDATES"));
+                        // service bus name for FHIR Updates
+                        var serviceBusName = Utils.GetEnvironmentVariable("SA-SERVICEBUSNAMESPACEFHIRUPDATES");
+
+                        _queueClient = new ServiceBusClient(serviceBusName);
                         _sender = _queueClient.CreateSender(_qname);
 
-
+                        // explicitely set the bulk queue details
+                        _qname_bulk = Utils.GetEnvironmentVariable("SA-SERVICEBUSQUEUENAMEFHIRBULK");
+                        _queueClientBulk = new ServiceBusClient(serviceBusName);
+                        _senderBulk = _queueClientBulk.CreateSender(_qname_bulk);
                     }
                     catch (Exception e)
                     {
@@ -141,9 +153,6 @@ namespace FHIRProxy.postprocessors
                     entries.Add(stub);
                 }
                 await publishFHIREvents(entries,log);
-
-
-
             }
 
             catch (Exception exception)
@@ -157,32 +166,45 @@ namespace FHIRProxy.postprocessors
         }
         private async Task publishFHIREvents(JArray entries,ILogger log)
         {
-         
-                if (!entries.IsNullOrEmpty())
-                {
-                    using ServiceBusMessageBatch messageBatch = await _sender.CreateMessageBatchAsync();
-                    foreach (JToken tok in entries)
-                    {
-                            //Don't queue if no supported
-                            if (!Array.Exists(_fhirSupportedResources, element => element == tok["resource"].FHIRResourceType()))
-                                continue;
+            if (!entries.IsNullOrEmpty())
+            {
+                using ServiceBusMessageBatch messageBatch = await _sender.CreateMessageBatchAsync();
+                using ServiceBusMessageBatch messageBatchBulk = await _senderBulk.CreateMessageBatchAsync();
 
-                            string entrystatus = (string)tok["response"]["status"];
-                            ServiceBusMessage dta = createMsg(entrystatus, tok["resource"]);
-                            if (!messageBatch.TryAddMessage(dta))
-                            {
-                                throw new Exception("FHIRCDSSyncAgentPostProcess2:Message Batch is too large");
-                            }
-                           
+                foreach (JToken tok in entries)
+                {
+                    //Don't queue if no supported
+                    if (!Array.Exists(_fhirSupportedResources, element => element == tok["resource"].FHIRResourceType()))
+                        continue;
+
+                    string entrystatus = (string)tok["response"]["status"];
+                    
+                    ServiceBusMessage dta = createMsg(entrystatus, tok["resource"], out bool bulkQueue);
+
+                    if (bulkQueue) 
+                    {
+                        if (!messageBatchBulk.TryAddMessage(dta))
+                        {
+                            throw new Exception("FHIRCDSSyncAgentPostProcess2: Message Batch is too large");
+                        }
                     }
-                    // Send the message batch to the queue.
-                    await _sender.SendMessagesAsync(messageBatch);
-              
+                    else
+                    {
+                        if (!messageBatch.TryAddMessage(dta))
+                        {
+                            throw new Exception("FHIRCDSSyncAgentPostProcess2:Message Batch is too large");
+                        }
+                    }
                 }
-            
+                // Send the message batch to the queue.
+                await _sender.SendMessagesAsync(messageBatch);
+                await _senderBulk.SendMessagesAsync(messageBatch);
+            }
         }
-        private ServiceBusMessage createMsg(string status,JToken resource)
+        private ServiceBusMessage createMsg(string status,JToken resource, out bool bulkQueue)
         {
+            bulkQueue = false;
+
             if (resource.IsNullOrEmpty()) return null;
             string action = "Unknown";
             if (status.StartsWith("200")) action = _updateAction;
@@ -216,6 +238,13 @@ namespace FHIRProxy.postprocessors
                 {
                     partitionkey = (string)resource["subject"]["reference"];
                 }
+                else 
+                {
+                    // create a new Partition key
+                    partitionkey = resource.FHIRReferenceId();
+                    bulkQueue = true;
+                }
+
                 dta.PartitionKey = partitionkey;
                 //Set session to be the same as partition key
                 dta.SessionId = partitionkey;
